@@ -37,3 +37,97 @@ jobs:
           LANGUAGE: ${{ vars.LANGUAGE }}
         run: |
           uv run main.py --debug
+
+name: SMTP connectivity & debug test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smtp-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: sudo apt update && sudo apt install -y netcat-openbsd openssl python3
+
+      - name: DNS resolve & route
+        run: |
+          echo "Resolve ${{ secrets.SMTP_SERVER }}"
+          nslookup ${{ secrets.SMTP_SERVER }} || true
+          echo
+          echo "Route to 8.8.8.8:"
+          ip route get 8.8.8.8 || true
+
+      - name: TCP port check (netcat)
+        run: |
+          echo "Checking TCP connect to ${{ secrets.SMTP_SERVER }}:${{ secrets.SMTP_PORT }}"
+          nc -vz ${{ secrets.SMTP_SERVER }} ${{ secrets.SMTP_PORT }} || true
+
+      - name: OpenSSL STARTTLS handshake (shows cert / banners)
+        run: |
+          echo "OPENSSL STARTTLS output (may hang if server doesn't speak STARTTLS)"
+          timeout 15 openssl s_client -starttls smtp -crlf -connect ${{ secrets.SMTP_SERVER }}:${{ secrets.SMTP_PORT }} </dev/null || true
+
+      - name: Python SMTP debug (connect & STARTTLS, no login)
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: |
+          python3 - <<'PY'
+          import os, ssl, smtplib
+          host = os.getenv("SMTP_SERVER")
+          port = int(os.getenv("SMTP_PORT") or 0)
+          print("Connecting to", host, port)
+          try:
+              s = smtplib.SMTP(host, port, timeout=30)
+              s.set_debuglevel(1)   # 关键：打印 SMTP 对话
+              s.ehlo()
+              try:
+                  s.starttls(context=ssl.create_default_context())
+                  s.ehlo()
+                  print("STARTTLS ok")
+              except Exception as e:
+                  print("STARTTLS failed:", e)
+              s.quit()
+          except Exception as e:
+              print("Connection/login attempt raised:", repr(e))
+              raise
+          PY
+
+      - name: Optional: Python SMTP login test (uses secrets, will be masked)
+        if: ${{ secrets.SMTP_PASSWORD != '' && secrets.SMTP_SENDER != '' }}
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import os, ssl, smtplib
+          host = os.getenv("SMTP_SERVER")
+          port = int(os.getenv("SMTP_PORT") or 0)
+          sender = os.getenv("SMTP_SENDER")
+          pwd = os.getenv("SMTP_PASSWORD")
+          print("Attempting login (password is masked by Actions)...")
+          try:
+              # Use SSL for port 465, otherwise STARTTLS
+              if port == 465:
+                  s = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30)
+                  s.set_debuglevel(1)
+                  s.login(sender, pwd)
+                  s.quit()
+                  print("Login OK via SSL")
+              else:
+                  s = smtplib.SMTP(host, port, timeout=30)
+                  s.set_debuglevel(1)
+                  s.ehlo()
+                  s.starttls(context=ssl.create_default_context())
+                  s.ehlo()
+                  s.login(sender, pwd)
+                  s.quit()
+                  print("Login OK via STARTTLS")
+          except Exception as e:
+              print("Login test failed:", repr(e))
+              raise
+          PY
+// ...existing code...
